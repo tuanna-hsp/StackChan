@@ -9,7 +9,9 @@ CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_LANGUAGE_EN_US=y
 CONFIG_BOARD_TYPE_M5STACK_STACK_CHAN=y
-CONFIG_USE_HOTSPOT_WIFI_PROVISIONING=n
+# Hotspot Wi-Fi setup page: used with Gemini Live, because self-built firmware cannot pass
+# the StackChan App's BLE handshake (it needs M5Stack's private secret_logic).
+CONFIG_USE_HOTSPOT_WIFI_PROVISIONING=y
 CONFIG_USE_ESP_BLUFI_WIFI_PROVISIONING=n
 CONFIG_SEND_WAKE_WORD_DATA=n
 CONFIG_SR_WN_WN9L_HISTACKCHAN_TTS3=y
@@ -86,3 +88,24 @@ CONFIG_LV_BUILD_DEMOS=n
 
 # ESP-NOW security responder still uses protocomm security version 1.
 CONFIG_ESP_PROTOCOMM_SUPPORT_SECURITY_VERSION_1=y
+
+# Google serves GTS Root R4 cross-signed by "GlobalSign Root CA", which is no longer in the
+# bundle. Let the verifier match the cross-signed GTS root that is in it (needed for Gemini Live).
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_CROSS_SIGNED_VERIFY=y
+
+# Software AES for TLS. Hardware AES must copy PSRAM data through two DMA-capable internal
+# RAM chunks per call, and with the AI agent running internal RAM is too fragmented for
+# them, so TLS sends to Gemini failed. Throughput needed here is tiny.
+CONFIG_MBEDTLS_HARDWARE_AES=n
+
+# Let Wi-Fi and lwIP buffers use PSRAM. With the AI agent running only ~15 KB of fragmented
+# internal RAM is left, and the 7 KB Gemini setup message stalled (SSL send timeout).
+CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
+# Each static Wi-Fi TX buffer holds ~1.6 KB of internal RAM; 16 left too little for the AI agent.
+CONFIG_ESP_WIFI_STATIC_TX_BUFFER_NUM=6
+# Gemini Live streams ~43 KB/s of base64 mic audio up; a bigger send buffer (in PSRAM)
+# keeps the upload from blocking. The receive window stays at its default: Wi-Fi has only
+# 6 RX buffers, and a larger window lets bursts and out-of-order segments fill them all,
+# which stalls the connection. Limit the out-of-order queue for the same reason.
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=32768
+CONFIG_LWIP_TCP_OOSEQ_MAX_PBUFS=2

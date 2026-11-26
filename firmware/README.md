@@ -1,4 +1,9 @@
 
+## Gemini Live
+
+The AI Agent uses Google Gemini Live. See [GEMINI_LIVE.md](GEMINI_LIVE.md) for setup,
+the settings page and how it works.
+
 ## Build
 
 ### Fetch Dependencies

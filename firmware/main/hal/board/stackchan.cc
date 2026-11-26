@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <mutex>
 #include "stackchan_camera.h"
+#include <hal/gemini/gemini_live.h>
 #include "hal_bridge.h"
 #include <hal/hal.h>
 
@@ -691,9 +692,16 @@ public:
     }
 
     // All fallback paths (no saved SSID, timeout, explicit reconfiguration) use
-    // the same BLE App setup flow. Never start the upstream configuration AP.
+    // the same setup flow. With Gemini Live it is the upstream configuration
+    // hotspot: the StackChan App's BLE setup needs a handshake token that only
+    // M5Stack's private secret_logic produces, so self-built firmware cannot use it.
     void StartWifiConfigMode() override
     {
+        if (gemini_live::is_enabled()) {
+            ESP_LOGW(TAG, "WiFi setup required; starting configuration hotspot");
+            WifiBoard::StartWifiConfigMode();
+            return;
+        }
         ESP_LOGW(TAG, "WiFi setup required; opening StackChan App setup");
         GetHAL().requestAppSetup();
     }
