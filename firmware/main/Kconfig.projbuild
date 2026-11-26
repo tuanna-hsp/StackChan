@@ -792,7 +792,8 @@ config USE_AUDIO_DEBUGGER
         Enable audio debugger, send audio data through UDP to the host machine
 
 menu "WiFi Configuration Method"
-    depends on !BOARD_TYPE_M5STACK_STACK_CHAN
+    # StackChan normally uses its App's BLE setup. Gemini Live builds use the hotspot,
+    # since self-built firmware cannot pass the App's handshake (see sdkconfig.defaults).
     help
         WiFi Configuration Method Selection
     config USE_HOTSPOT_WIFI_PROVISIONING

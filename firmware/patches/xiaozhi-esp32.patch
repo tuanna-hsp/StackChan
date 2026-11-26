@@ -1,5 +1,5 @@
 diff --git a/main/application.cc b/main/application.cc
-index 31de205..50096d8 100644
+index 31de205..c8a63f9 100644
 --- a/main/application.cc
 +++ b/main/application.cc
 @@ -1,4 +1,5 @@
@@ -8,7 +8,43 @@ index 31de205..50096d8 100644
  #include "assets.h"
  #include "assets/lang_config.h"
  #include "audio_codec.h"
-@@ -442,6 +443,7 @@ void Application::CheckAssetsVersion() {
+@@ -11,6 +12,8 @@
+ #include "system_info.h"
+ #include "text_glyph_payload.h"
+ #include "websocket_protocol.h"
++#include <hal/gemini/gemini_live.h>
++#include <esp_heap_caps.h>
+ 
+ #include <driver/gpio.h>
+ #include <esp_log.h>
+@@ -306,6 +309,11 @@ void Application::HandleNetworkConnectedEvent() {
+                 vTaskDelete(NULL);
+             },
+             "activation", 4096 * 2, this, 2, &activation_task_handle_);
++        if (activation_task_handle_ == nullptr) {
++            ESP_LOGE(TAG, "Failed to create activation task (internal RAM free %u, largest %u)",
++                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
++                     (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
++        }
+     }
+ 
+     // Update the status bar immediately to show the network state
+@@ -369,8 +377,12 @@ void Application::ActivationTask() {
+     // Check for new assets version
+     CheckAssetsVersion();
+ 
+-    // Check for new firmware version
+-    CheckNewVersion();
++    // Check for new firmware version. Gemini Live talks to Google directly, so the
++    // xiaozhi server's version check, activation and app binding are skipped (an OTA
++    // from that server would also replace this firmware).
++    if (!gemini_live::is_enabled()) {
++        CheckNewVersion();
++    }
+ 
+     // Initialize the protocol
+     InitializeProtocol();
+@@ -442,6 +454,7 @@ void Application::CheckAssetsVersion() {
  void Application::CheckNewVersion() {
      const int MAX_RETRY = 10;
      int retry_count = 0;
@@ -16,7 +52,7 @@ index 31de205..50096d8 100644
      int retry_delay = 10;  // Initial retry delay in seconds
  
      auto& board = Board::GetInstance();
-@@ -499,15 +501,18 @@ void Application::CheckNewVersion() {
+@@ -499,15 +512,18 @@ void Application::CheckNewVersion() {
  
          // No new version, mark the current version as valid
          ota_->MarkCurrentVersionValid();
@@ -39,7 +75,31 @@ index 31de205..50096d8 100644
          }
  
          // This will block the loop until the activation is done or timeout
-@@ -725,30 +730,6 @@ void Application::InitializeProtocol() {
+@@ -535,7 +551,10 @@ void Application::InitializeProtocol() {
+ 
+     display->SetStatus(Lang::Strings::LOADING_PROTOCOL);
+ 
+-    if (ota_->HasMqttConfig()) {
++    if (gemini_live::is_enabled()) {
++        protocol_ = gemini_live::create_protocol();
++        audio_service_.SetPcmPassthrough(true);
++    } else if (ota_->HasMqttConfig()) {
+         protocol_ = std::make_unique<MqttProtocol>();
+     } else if (ota_->HasWebsocketConfig()) {
+         protocol_ = std::make_unique<WebsocketProtocol>();
+@@ -553,7 +572,10 @@ void Application::InitializeProtocol() {
+ 
+     protocol_->OnIncomingAudio([this](std::unique_ptr<AudioStreamPacket> packet) {
+         if (GetDeviceState() == kDeviceStateSpeaking) {
+-            audio_service_.PushPacketToDecodeQueue(std::move(packet));
++            // PCM streams (Gemini Live) arrive faster than real time: wait for queue
++            // space instead of dropping audio once the decode queue is full.
++            const bool wait = packet->is_pcm;
++            audio_service_.PushPacketToDecodeQueue(std::move(packet), wait);
+         }
+     });
+ 
+@@ -725,30 +747,6 @@ void Application::InitializeProtocol() {
      protocol_->Start();
  }
  
@@ -70,7 +130,7 @@ index 31de205..50096d8 100644
  void Application::Alert(const char* status, const char* message, const char* emotion,
                          const std::string_view& sound) {
      ESP_LOGW(TAG, "Alert [%s] %s: %s", emotion, status, message);
-@@ -833,6 +814,7 @@ void Application::ContinueOpenAudioChannel(ListeningMode mode) {
+@@ -833,6 +831,7 @@ void Application::ContinueOpenAudioChannel(ListeningMode mode) {
          if (!protocol_->OpenAudioChannel()) {
              // Return to idle so the device is not stuck in the connecting
              // state (not every failure path reports a network error)
@@ -78,7 +138,7 @@ index 31de205..50096d8 100644
              SetDeviceState(kDeviceStateIdle);
              return;
          }
-@@ -970,6 +952,7 @@ void Application::ContinueWakeWordInvoke(const std::string& wake_word) {
+@@ -970,6 +969,7 @@ void Application::ContinueWakeWordInvoke(const std::string& wake_word) {
              // Return to idle so the device is not stuck in the connecting
              // state (not every failure path reports a network error), and
              // wake word detection is re-enabled by the idle state handler.
@@ -86,11 +146,38 @@ index 31de205..50096d8 100644
              SetDeviceState(kDeviceStateIdle);
              return;
          }
+@@ -1052,6 +1052,7 @@ void Application::HandleStateChangedEvent() {
+                 audio_service_.EnableWakeWordDetection(audio_service_.IsAfeWakeWord());
+             }
+             audio_service_.ResetDecoder();
++            speaking_epoch_++;
+             break;
+         case kDeviceStateNotifying:
+             display->SetStatus(Lang::Strings::SPEAKING);
 diff --git a/main/application.h b/main/application.h
-index f2b9a00..68f01d1 100644
+index f2b9a00..171cb86 100644
 --- a/main/application.h
 +++ b/main/application.h
-@@ -180,7 +180,6 @@ private:
+@@ -118,6 +118,10 @@ public:
+     AecMode GetAecMode() const { return aec_mode_; }
+     void PlaySound(const std::string_view& sound);
+     AudioService& GetAudioService() { return audio_service_; }
++    // Incremented after entering the speaking state has reset the decoder.
++    // Protocols that stream audio right after "tts start" wait for it to change,
++    // so the reset does not discard their first audio packets.
++    uint32_t GetSpeakingEpoch() const { return speaking_epoch_.load(); }
+     
+     /**
+      * Reset protocol resources (thread-safe)
+@@ -147,6 +151,7 @@ private:
+     std::function<void(const std::string&)> mcp_broadcast_callback_;
+ 
+     bool has_server_time_ = false;
++    std::atomic<uint32_t> speaking_epoch_{0};
+     bool aborted_ = false;
+     bool assets_version_checked_ = false;
+     bool play_popup_on_listening_ = false;  // Flag to play popup sound after state changes to listening
+@@ -180,7 +185,6 @@ private:
      void CheckAssetsVersion();
      void CheckNewVersion();
      void InitializeProtocol();
@@ -98,6 +185,198 @@ index f2b9a00..68f01d1 100644
      void SetListeningMode(ListeningMode mode);
      ListeningMode GetDefaultListeningMode() const;
      
+diff --git a/main/audio/audio_service.cc b/main/audio/audio_service.cc
+index 7f7582b..b3f9f82 100644
+--- a/main/audio/audio_service.cc
++++ b/main/audio/audio_service.cc
+@@ -406,46 +406,50 @@ void AudioService::OpusCodecTask() {
+             task.playback_id = packet->playback_id;
+             task.media_position_ms = packet->media_position_ms;
+ 
+-            SetDecodeSampleRate(packet->sample_rate, packet->frame_duration);
+             bool decoded = false;
+-            if (opus_decoder_ != nullptr) {
+-                task.pcm.resize(decoder_frame_size_);
+-                esp_audio_dec_in_raw_t raw = {
+-                    .buffer = (uint8_t*)(packet->payload.data()),
+-                    .len = (uint32_t)(packet->payload.size()),
+-                    .consumed = 0,
+-                    .frame_recover = ESP_AUDIO_DEC_RECOVERY_NONE,
+-                };
+-                esp_audio_dec_out_frame_t out_frame = {
+-                    .buffer = (uint8_t*)(task.pcm.data()),
+-                    .len = (uint32_t)(task.pcm.size() * sizeof(int16_t)),
+-                    .decoded_size = 0,
+-                };
+-                esp_audio_dec_info_t dec_info = {};
+-                std::unique_lock<std::mutex> decoder_lock(decoder_mutex_);
+-                auto ret = esp_opus_dec_decode(opus_decoder_, &raw, &out_frame, &dec_info);
+-                decoder_lock.unlock();
+-                if (ret == ESP_AUDIO_ERR_OK) {
+-                    task.pcm.resize(out_frame.decoded_size / sizeof(int16_t));
+-                    if (decoder_sample_rate_ != codec_->output_sample_rate() &&
+-                        output_resampler_ != nullptr) {
+-                        uint32_t target_size = 0;
+-                        esp_ae_rate_cvt_get_max_out_sample_num(output_resampler_, task.pcm.size(),
+-                                                               &target_size);
+-                        std::vector<int16_t> resampled(target_size);
+-                        uint32_t actual_output = target_size;
+-                        esp_ae_rate_cvt_process(output_resampler_, (esp_ae_sample_t)task.pcm.data(),
+-                                                task.pcm.size(), (esp_ae_sample_t)resampled.data(),
+-                                                &actual_output);
+-                        resampled.resize(actual_output);
+-                        task.pcm = std::move(resampled);
++            if (packet->is_pcm) {
++                decoded = DecodePcmPacket(*packet, task.pcm);
++            } else {
++                SetDecodeSampleRate(packet->sample_rate, packet->frame_duration);
++                if (opus_decoder_ != nullptr) {
++                    task.pcm.resize(decoder_frame_size_);
++                    esp_audio_dec_in_raw_t raw = {
++                        .buffer = (uint8_t*)(packet->payload.data()),
++                        .len = (uint32_t)(packet->payload.size()),
++                        .consumed = 0,
++                        .frame_recover = ESP_AUDIO_DEC_RECOVERY_NONE,
++                    };
++                    esp_audio_dec_out_frame_t out_frame = {
++                        .buffer = (uint8_t*)(task.pcm.data()),
++                        .len = (uint32_t)(task.pcm.size() * sizeof(int16_t)),
++                        .decoded_size = 0,
++                    };
++                    esp_audio_dec_info_t dec_info = {};
++                    std::unique_lock<std::mutex> decoder_lock(decoder_mutex_);
++                    auto ret = esp_opus_dec_decode(opus_decoder_, &raw, &out_frame, &dec_info);
++                    decoder_lock.unlock();
++                    if (ret == ESP_AUDIO_ERR_OK) {
++                        task.pcm.resize(out_frame.decoded_size / sizeof(int16_t));
++                        if (decoder_sample_rate_ != codec_->output_sample_rate() &&
++                            output_resampler_ != nullptr) {
++                            uint32_t target_size = 0;
++                            esp_ae_rate_cvt_get_max_out_sample_num(output_resampler_, task.pcm.size(),
++                                                                   &target_size);
++                            std::vector<int16_t> resampled(target_size);
++                            uint32_t actual_output = target_size;
++                            esp_ae_rate_cvt_process(output_resampler_, (esp_ae_sample_t)task.pcm.data(),
++                                                    task.pcm.size(), (esp_ae_sample_t)resampled.data(),
++                                                    &actual_output);
++                            resampled.resize(actual_output);
++                            task.pcm = std::move(resampled);
++                        }
++                        decoded = true;
++                    } else {
++                        ESP_LOGE(TAG, "Failed to decode audio after resize, error code: %d", ret);
+                     }
+-                    decoded = true;
+                 } else {
+-                    ESP_LOGE(TAG, "Failed to decode audio after resize, error code: %d", ret);
++                    ESP_LOGE(TAG, "Audio decoder is not configured");
+                 }
+-            } else {
+-                ESP_LOGE(TAG, "Audio decoder is not configured");
+             }
+ 
+             lock.lock();
+@@ -474,7 +478,23 @@ void AudioService::OpusCodecTask() {
+             packet->sample_rate = 16000;
+             packet->timestamp = task.timestamp;
+ 
+-            if (opus_encoder_ != nullptr && task.pcm.size() == encoder_frame_size_) {
++            if (pcm_passthrough_.load() && task.type == kAudioTaskTypeEncodeToSendQueue) {
++                // Raw PCM16 for servers that accept PCM directly; skips Opus encoding.
++                packet->payload.assign(
++                    reinterpret_cast<const uint8_t*>(task.pcm.data()),
++                    reinterpret_cast<const uint8_t*>(task.pcm.data() + task.pcm.size()));
++                {
++                    std::lock_guard<std::mutex> lock2(audio_queue_mutex_);
++                    if (audio_send_queue_.size() >= MAX_SEND_PACKETS_IN_QUEUE) {
++                        audio_send_queue_.pop_front();
++                    }
++                    audio_send_queue_.push_back(std::move(packet));
++                }
++                if (callbacks_.on_send_queue_available) {
++                    callbacks_.on_send_queue_available();
++                }
++                debug_statistics_.encode_count++;
++            } else if (opus_encoder_ != nullptr && task.pcm.size() == encoder_frame_size_) {
+                 packet->payload.resize(encoder_outbuf_size_);
+                 esp_audio_enc_in_frame_t in = {
+                     .buffer = (uint8_t*)(task.pcm.data()),
+@@ -529,6 +549,43 @@ void AudioService::OpusCodecTask() {
+     ESP_LOGW(TAG, "Opus codec task stopped");
+ }
+ 
++bool AudioService::DecodePcmPacket(const AudioStreamPacket& packet, std::vector<int16_t>& pcm) {
++    const size_t samples = packet.payload.size() / sizeof(int16_t);
++    if (samples == 0) {
++        return false;
++    }
++    pcm.resize(samples);
++    memcpy(pcm.data(), packet.payload.data(), samples * sizeof(int16_t));
++
++    const int output_rate = codec_->output_sample_rate();
++    if (packet.sample_rate == output_rate) {
++        return true;
++    }
++    // Only this codec task touches pcm_resampler_, so no lock is needed.
++    if (pcm_resampler_ == nullptr || pcm_resampler_rate_ != packet.sample_rate) {
++        if (pcm_resampler_ != nullptr) {
++            esp_ae_rate_cvt_close(pcm_resampler_);
++            pcm_resampler_ = nullptr;
++        }
++        esp_ae_rate_cvt_cfg_t cfg = RATE_CVT_CFG(packet.sample_rate, output_rate, ESP_AUDIO_MONO);
++        esp_ae_rate_cvt_open(&cfg, &pcm_resampler_);
++        if (pcm_resampler_ == nullptr) {
++            ESP_LOGE(TAG, "Failed to create PCM resampler %d -> %d", packet.sample_rate, output_rate);
++            return false;
++        }
++        pcm_resampler_rate_ = packet.sample_rate;
++    }
++    uint32_t target_size = 0;
++    esp_ae_rate_cvt_get_max_out_sample_num(pcm_resampler_, pcm.size(), &target_size);
++    std::vector<int16_t> resampled(target_size);
++    uint32_t actual_output = target_size;
++    esp_ae_rate_cvt_process(pcm_resampler_, (esp_ae_sample_t)pcm.data(), pcm.size(),
++                            (esp_ae_sample_t)resampled.data(), &actual_output);
++    resampled.resize(actual_output);
++    pcm = std::move(resampled);
++    return true;
++}
++
+ void AudioService::SetDecodeSampleRate(int sample_rate, int frame_duration) {
+     if (decoder_sample_rate_ == sample_rate && decoder_duration_ms_ == frame_duration) {
+         return;
+diff --git a/main/audio/audio_service.h b/main/audio/audio_service.h
+index f8b510f..e9bed5f 100644
+--- a/main/audio/audio_service.h
++++ b/main/audio/audio_service.h
+@@ -147,6 +147,8 @@ public:
+     bool ReadAudioData(std::vector<int16_t>& data, int sample_rate, int samples);
+     void ResetDecoder();
+     void SetModelsList(srmodel_list_t* models_list);
++    // Send raw PCM16 (16 kHz) instead of Opus for outgoing voice packets.
++    void SetPcmPassthrough(bool enable) { pcm_passthrough_ = enable; }
+ 
+ private:
+     AudioCodec* codec_ = nullptr;
+@@ -159,6 +161,10 @@ private:
+     std::mutex input_resampler_mutex_;
+     esp_ae_rate_cvt_handle_t input_resampler_ = nullptr;
+     esp_ae_rate_cvt_handle_t output_resampler_ = nullptr;
++    // PCM passthrough (see AudioStreamPacket::is_pcm)
++    std::atomic<bool> pcm_passthrough_{false};
++    esp_ae_rate_cvt_handle_t pcm_resampler_ = nullptr;
++    int pcm_resampler_rate_ = 0;
+ 
+     // Encoder/Decoder state
+     int encoder_sample_rate_ = 16000;
+@@ -217,6 +223,7 @@ private:
+     void PushTaskToEncodeQueue(AudioTaskType type, std::vector<int16_t>&& pcm);
+     bool InitializeAudioEngine();
+     void SetDecodeSampleRate(int sample_rate, int frame_duration);
++    bool DecodePcmPacket(const AudioStreamPacket& packet, std::vector<int16_t>& pcm);
+     void CheckAndUpdateAudioPowerState();
+     bool IsPlaybackDrainedLocked() const;
+     bool MarkPlaybackDrainedLocked();
 diff --git a/main/boards/common/esp_video.cc b/main/boards/common/esp_video.cc
 index 2f31a49..4cf6f63 100644
 --- a/main/boards/common/esp_video.cc
@@ -598,3 +877,17 @@ index eda3fd7..ce17ee5 100644
      bool has_serial_number_ = false;
      bool has_activation_challenge_ = false;
      std::string current_version_;
+diff --git a/main/protocols/protocol.h b/main/protocols/protocol.h
+index cfa0dd2..4c28aa1 100644
+--- a/main/protocols/protocol.h
++++ b/main/protocols/protocol.h
+@@ -14,6 +14,9 @@ struct AudioStreamPacket {
+     uint32_t playback_id = 0;
+     uint32_t media_position_ms = 0;
+     std::vector<uint8_t> payload;
++    // true: payload is raw little-endian PCM16 mono at sample_rate (no Opus).
++    // Used by protocols whose server speaks PCM directly (e.g. Gemini Live).
++    bool is_pcm = false;
+ };
+ 
+ struct BinaryProtocol2 {
