@@ -7,6 +7,8 @@
 #include <algorithm>
 #include <application.h>
 #include <board.h>
+#include <hal/board/stackchan_camera.h>
+#include <jpg/image_to_jpeg.h>
 #include <mcp_server.h>
 #include <assets/lang_config.h>
 #include <cJSON.h>
@@ -25,6 +27,9 @@ constexpr const char* kGeminiUrl =
     "wss://generativelanguage.googleapis.com/ws/"
     "google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent";
 constexpr int kInputSampleRate       = 16000;
+// Mic audio upload rate. 8000 halves the upload (Gemini resamples input itself), at some
+// cost in recognition quality; 16 kHz is used now that Wi-Fi has the RAM to keep up.
+constexpr int kUploadSampleRate      = 16000;
 constexpr int kDefaultOutputRate     = 24000;
 constexpr int kSetupTimeoutMs        = 10000;
 // Close the session after this long without conversation, back to wake word standby.
@@ -34,6 +39,19 @@ constexpr int kSpeakingWaitMs        = 1000;
 // The decode queue holds 20 packets, so 200 ms packets give it ~4 s of headroom.
 constexpr int kPcmPacketMs           = 200;
 constexpr int kPcmPrebufferMs        = 500;
+// The receive task (priority 1) parses, decodes and decrypts every message. During long
+// answers that can keep its CPU busy for seconds, starving the idle task and tripping the
+// task watchdog, so it sleeps one tick at least this often while busy.
+constexpr TickType_t kYieldInterval  = pdMS_TO_TICKS(500);
+constexpr const char* kTakePhotoTool = "self.camera.take_photo";
+constexpr uint8_t kPhotoJpegQuality  = 60;
+// Mic audio queued for upload beyond this (~3 s of 60 ms packets) is dropped, oldest first.
+// Dropping breaks up speech and Gemini cannot understand it, so this only guards against
+// a stalled connection; a short backlog is caught up during pauses.
+constexpr size_t kMaxQueuedAudio     = 50;
+constexpr int kStatsIntervalMs       = 5000;
+// Set to true to log upload/download rates and per-task CPU use every 5 s in a session.
+constexpr bool kLogStats             = false;
 constexpr EventBits_t kSetupDoneBit  = BIT0;
 constexpr EventBits_t kClosedBit     = BIT1;
 
@@ -143,10 +161,30 @@ GeminiLiveProtocol::GeminiLiveProtocol()
     args.arg                     = this;
     args.name                    = "gemini_idle";
     esp_timer_create(&args, &idle_timer_);
+
+    // PSRAM stack: internal RAM is too scarce. The task never touches flash.
+    if (xTaskCreatePinnedToCoreWithCaps(
+            [](void* arg) {
+                static_cast<GeminiLiveProtocol*>(arg)->SenderTask();
+                vTaskDeleteWithCaps(nullptr);
+            },
+            "gemini_send", 6144, this, 3, &sender_task_, tskNO_AFFINITY,
+            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create sender task");
+        sender_task_ = nullptr;
+    }
 }
 
 GeminiLiveProtocol::~GeminiLiveProtocol()
 {
+    {
+        std::lock_guard<std::mutex> lock(send_mutex_);
+        sender_stop_ = true;
+    }
+    send_cv_.notify_all();
+    while (sender_task_ != nullptr && eTaskGetState(sender_task_) != eDeleted) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
     if (idle_timer_ != nullptr) {
         esp_timer_stop(idle_timer_);
         esp_timer_delete(idle_timer_);
@@ -223,8 +261,12 @@ GeminiLiveProtocol::ConnectResult GeminiLiveProtocol::Connect(const gemini_live:
     model_text_.clear();
     xEventGroupClearBits(event_group_, kSetupDoneBit | kClosedBit);
 
+    ClearSendQueue();
     auto network = Board::GetInstance().GetNetwork();
-    websocket_   = network->CreateWebSocket(1);
+    {
+        std::lock_guard<std::mutex> lock(socket_mutex_);
+        websocket_ = network->CreateWebSocket(1);
+    }
     if (websocket_ == nullptr) {
         ESP_LOGE(TAG, "Failed to create websocket");
         return ConnectResult::kNetworkError;
@@ -251,12 +293,12 @@ GeminiLiveProtocol::ConnectResult GeminiLiveProtocol::Connect(const gemini_live:
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA));
     if (auto connected = websocket_->Connect(kGeminiUrl); !connected) {
         ESP_LOGE(TAG, "Failed to connect: %s", connected.error().ToString().c_str());
-        websocket_.reset();
+        ResetSocket();
         return ConnectResult::kNetworkError;
     }
 
-    if (!SendText(BuildSetupMessage(config, with_transcription))) {
-        websocket_.reset();
+    if (!SendNow(BuildSetupMessage(config, with_transcription))) {
+        ResetSocket();
         return ConnectResult::kNetworkError;
     }
 
@@ -264,7 +306,7 @@ GeminiLiveProtocol::ConnectResult GeminiLiveProtocol::Connect(const gemini_live:
                                                  pdMS_TO_TICKS(kSetupTimeoutMs));
     if (!(bits & kSetupDoneBit)) {
         ESP_LOGE(TAG, "Setup %s", (bits & kClosedBit) ? "refused (connection closed)" : "timed out");
-        websocket_.reset();
+        ResetSocket();
         return (bits & kClosedBit) ? ConnectResult::kSetupRefused : ConnectResult::kNetworkError;
     }
 
@@ -284,7 +326,8 @@ void GeminiLiveProtocol::CloseAudioChannel(bool /*send_goodbye*/)
     // websocket can join it.
     Application::GetInstance().GetAudioService().ResetDecoder();
     const bool was_open = channel_open_.exchange(false);
-    websocket_.reset();
+    ClearSendQueue();
+    ResetSocket();
     in_model_turn_ = false;
     if (was_open && on_audio_channel_closed_ != nullptr) {
         on_audio_channel_closed_();
@@ -298,6 +341,12 @@ bool GeminiLiveProtocol::IsAudioChannelOpened() const
 
 bool GeminiLiveProtocol::SendText(const std::string& text)
 {
+    return Enqueue(text, false);
+}
+
+bool GeminiLiveProtocol::SendNow(const std::string& text)
+{
+    std::lock_guard<std::mutex> lock(socket_mutex_);
     if (websocket_ == nullptr || !websocket_->IsConnected()) {
         return false;
     }
@@ -306,6 +355,138 @@ bool GeminiLiveProtocol::SendText(const std::string& text)
         return false;
     }
     return true;
+}
+
+bool GeminiLiveProtocol::Enqueue(std::string text, bool is_audio)
+{
+    if (sender_task_ == nullptr) {
+        return SendNow(text);
+    }
+    {
+        std::lock_guard<std::mutex> lock(send_mutex_);
+        if (is_audio && queued_audio_ >= kMaxQueuedAudio) {
+            auto oldest = std::find_if(send_queue_.begin(), send_queue_.end(),
+                                       [](const Outgoing& item) { return item.is_audio; });
+            if (oldest != send_queue_.end()) {
+                send_queue_.erase(oldest);
+                --queued_audio_;
+                stat_up_dropped_++;
+            }
+        }
+        send_queue_.push_back({std::move(text), is_audio});
+        if (is_audio) {
+            ++queued_audio_;
+        }
+    }
+    send_cv_.notify_one();
+    return true;
+}
+
+void GeminiLiveProtocol::ResetSocket()
+{
+    std::lock_guard<std::mutex> lock(socket_mutex_);
+    websocket_.reset();
+}
+
+void GeminiLiveProtocol::ClearSendQueue()
+{
+    std::lock_guard<std::mutex> lock(send_mutex_);
+    send_queue_.clear();
+    queued_audio_ = 0;
+}
+
+void GeminiLiveProtocol::SenderTask()
+{
+    int64_t next_stats_us = esp_timer_get_time() + kStatsIntervalMs * 1000LL;
+    while (true) {
+        Outgoing item;
+        {
+            std::unique_lock<std::mutex> lock(send_mutex_);
+            send_cv_.wait_for(lock, std::chrono::milliseconds(500),
+                              [this]() { return sender_stop_ || !send_queue_.empty(); });
+            if (sender_stop_) {
+                break;
+            }
+            if (!send_queue_.empty()) {
+                item = std::move(send_queue_.front());
+                send_queue_.pop_front();
+                if (item.is_audio) {
+                    --queued_audio_;
+                }
+            }
+        }
+        if (!item.text.empty()) {
+            const int64_t start = esp_timer_get_time();
+            if (SendNow(item.text)) {
+                const uint32_t ms = (esp_timer_get_time() - start) / 1000;
+                if (ms > 500) {
+                    ESP_LOGW(TAG, "Slow send: %u bytes took %u ms", (unsigned)item.text.size(), (unsigned)ms);
+                }
+                stat_up_msgs_++;
+                stat_up_bytes_ += item.text.size();
+                stat_send_total_ms_ += ms;
+                if (ms > stat_send_max_ms_) {
+                    stat_send_max_ms_ = ms;
+                }
+            }
+        }
+        if (esp_timer_get_time() >= next_stats_us) {
+            next_stats_us = esp_timer_get_time() + kStatsIntervalMs * 1000LL;
+            if (kLogStats && channel_open_) {
+                LogStats();
+            }
+        }
+    }
+    sender_task_ = nullptr;
+}
+
+void GeminiLiveProtocol::LogStats()
+{
+    const uint32_t up_msgs = stat_up_msgs_.exchange(0);
+    const uint32_t up_ms   = stat_send_total_ms_.exchange(0);
+    size_t queued          = 0;
+    {
+        std::lock_guard<std::mutex> lock(send_mutex_);
+        queued = send_queue_.size();
+    }
+    ESP_LOGI(TAG,
+             "Stats %ds: up %u msgs %u KB (send avg %u ms, max %u ms, dropped %u, queued %u) | "
+             "down %u msgs %u KB, audio %u ms | internal RAM %u",
+             kStatsIntervalMs / 1000, (unsigned)up_msgs, (unsigned)(stat_up_bytes_.exchange(0) / 1024),
+             (unsigned)(up_msgs ? up_ms / up_msgs : 0), (unsigned)stat_send_max_ms_.exchange(0),
+             (unsigned)stat_up_dropped_.exchange(0), (unsigned)queued, (unsigned)stat_down_msgs_.exchange(0),
+             (unsigned)(stat_down_bytes_.exchange(0) / 1024),
+             (unsigned)(stat_down_audio_bytes_.exchange(0) / (kDefaultOutputRate * 2 / 1000)),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+
+    // CPU use per task since the last report (top 8).
+    std::vector<TaskStatus_t> tasks(uxTaskGetNumberOfTasks() + 4);
+    uint32_t runtime = 0;
+    tasks.resize(uxTaskGetSystemState(tasks.data(), tasks.size(), &runtime));
+    const uint32_t elapsed = runtime - last_task_runtime_;
+    if (!last_task_stats_.empty() && elapsed > 0) {
+        std::vector<std::pair<uint32_t, const char*>> usage;
+        for (const auto& task : tasks) {
+            for (const auto& prev : last_task_stats_) {
+                if (prev.xHandle == task.xHandle) {
+                    usage.emplace_back(task.ulRunTimeCounter - prev.ulRunTimeCounter, task.pcTaskName);
+                    break;
+                }
+            }
+        }
+        std::sort(usage.begin(), usage.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+        std::string line;
+        for (size_t i = 0; i < usage.size() && i < 8; ++i) {
+            char entry[40];
+            // Two cores: 200% is both fully busy.
+            snprintf(entry, sizeof(entry), " %s %u%%", usage[i].second,
+                     (unsigned)((uint64_t)usage[i].first * 100 / elapsed));
+            line += entry;
+        }
+        ESP_LOGI(TAG, "CPU:%s", line.c_str());
+    }
+    last_task_stats_  = std::move(tasks);
+    last_task_runtime_ = runtime;
 }
 
 bool GeminiLiveProtocol::SendAudio(std::unique_ptr<AudioStreamPacket> packet)
@@ -318,12 +499,27 @@ bool GeminiLiveProtocol::SendAudio(std::unique_ptr<AudioStreamPacket> packet)
         // the answer gets the bandwidth and the speaker's echo cannot interrupt it.
         return true;
     }
+    const int input_rate = packet->sample_rate > 0 ? packet->sample_rate : kInputSampleRate;
+    const auto* samples  = reinterpret_cast<const int16_t*>(packet->payload.data());
+    size_t count         = packet->payload.size() / sizeof(int16_t);
+    int rate             = input_rate;
+    std::vector<int16_t> reduced;
+    if (kUploadSampleRate * 2 == input_rate) {
+        // Average sample pairs: a simple low-pass and 2:1 decimation, enough for speech.
+        reduced.resize(count / 2);
+        for (size_t i = 0; i < reduced.size(); ++i) {
+            reduced[i] = static_cast<int16_t>((samples[2 * i] + samples[2 * i + 1]) / 2);
+        }
+        samples = reduced.data();
+        count   = reduced.size();
+        rate    = kUploadSampleRate;
+    }
     std::string message = "{\"realtimeInput\":{\"audio\":{\"mimeType\":\"audio/pcm;rate=";
-    message += std::to_string(packet->sample_rate > 0 ? packet->sample_rate : kInputSampleRate);
+    message += std::to_string(rate);
     message += "\",\"data\":\"";
-    message += Base64Encode(packet->payload.data(), packet->payload.size());
+    message += Base64Encode(reinterpret_cast<const uint8_t*>(samples), count * sizeof(int16_t));
     message += "\"}}}";
-    return SendText(message);
+    return Enqueue(std::move(message), true);
 }
 
 void GeminiLiveProtocol::SendWakeWordDetected(const std::string& /*wake_word*/)
@@ -456,6 +652,8 @@ cJSON* GeminiLiveProtocol::BuildFunctionDeclarations()
 
 void GeminiLiveProtocol::OnMessage(const char* data, size_t len)
 {
+    stat_down_msgs_++;
+    stat_down_bytes_ += len;
     cJSON* root = cJSON_ParseWithLength(data, len);
     if (root == nullptr) {
         ESP_LOGW(TAG, "Unparsable message (%u bytes)", (unsigned)len);
@@ -479,6 +677,12 @@ void GeminiLiveProtocol::OnMessage(const char* data, size_t len)
         ESP_LOGI(TAG, "Unhandled message: %.*s", (int)std::min<size_t>(len, 200), data);
     }
     cJSON_Delete(root);
+
+    const TickType_t now = xTaskGetTickCount();
+    if (now - last_yield_tick_ >= kYieldInterval) {
+        vTaskDelay(1);
+        last_yield_tick_ = xTaskGetTickCount();
+    }
 }
 
 void GeminiLiveProtocol::HandleServerContent(const cJSON* content)
@@ -549,6 +753,7 @@ void GeminiLiveProtocol::HandleModelAudio(const cJSON* inline_data)
         return;
     }
     const int rate = ParsePcmRate(cJSON_IsString(mime_type) ? mime_type->valuestring : nullptr);
+    stat_down_audio_bytes_ += pcm.size();
 
     if (!in_model_turn_) {
         BeginModelTurn();
@@ -659,6 +864,14 @@ void GeminiLiveProtocol::HandleToolCall(const cJSON* tool_call)
         const std::string tool_name = name->valuestring;
         ESP_LOGI(TAG, "Tool call: %s", tool_name.c_str());
 
+        if (tool_name == kTakePhotoTool) {
+            // xiaozhi's version uploads the photo to the xiaozhi vision server; show it to
+            // Gemini instead.
+            const cJSON* question = cJSON_GetObjectItem(args, "question");
+            TakePhoto(call_id, tool_name, cJSON_IsString(question) ? question->valuestring : "");
+            continue;
+        }
+
         cJSON* request = cJSON_CreateObject();
         cJSON_AddStringToObject(request, "jsonrpc", "2.0");
         cJSON_AddNumberToObject(request, "id", next_mcp_id_++);
@@ -697,7 +910,12 @@ void GeminiLiveProtocol::SendToolResponse(const std::string& call_id, const std:
         }
     }
     cJSON_Delete(reply_json);
+    SendFunctionResult(call_id, name, text, is_error);
+}
 
+void GeminiLiveProtocol::SendFunctionResult(const std::string& call_id, const std::string& name,
+                                            const std::string& text, bool is_error)
+{
     cJSON* root      = cJSON_CreateObject();
     cJSON* response  = cJSON_AddObjectToObject(root, "toolResponse");
     cJSON* responses = cJSON_AddArrayToObject(response, "functionResponses");
@@ -711,6 +929,53 @@ void GeminiLiveProtocol::SendToolResponse(const std::string& call_id, const std:
     cJSON_AddItemToArray(responses, entry);
     SendText(PrintJson(root));
     cJSON_Delete(root);
+}
+
+void GeminiLiveProtocol::TakePhoto(const std::string& call_id, const std::string& name,
+                                   const std::string& question)
+{
+    // Like other tools, run on the main task: capture blocks, and the camera plays its
+    // shutter sound and preview.
+    Application::GetInstance().Schedule([this, call_id, name, question]() {
+        auto* camera = static_cast<StackChanCamera*>(Board::GetInstance().GetCamera());
+        if (camera == nullptr || !camera->Capture()) {
+            SendFunctionResult(call_id, name, "Failed to take a photo", true);
+            return;
+        }
+
+        uint8_t* jpeg   = nullptr;
+        size_t jpeg_len = 0;
+        {
+            auto lock = camera->TryLockFrame();
+            if (!lock.owns_lock() || camera->GetFrameData() == nullptr) {
+                SendFunctionResult(call_id, name, "The camera is busy", true);
+                return;
+            }
+            image_to_jpeg(const_cast<uint8_t*>(camera->GetFrameData()), camera->GetFrameSize(),
+                          camera->GetFrameWidth(), camera->GetFrameHeight(),
+                          static_cast<v4l2_pix_fmt_t>(camera->GetFrameFormat()), kPhotoJpegQuality, &jpeg,
+                          &jpeg_len);
+        }
+        if (jpeg == nullptr || jpeg_len == 0) {
+            free(jpeg);
+            SendFunctionResult(call_id, name, "Failed to encode the photo", true);
+            return;
+        }
+
+        std::string message = "{\"realtimeInput\":{\"video\":{\"mimeType\":\"image/jpeg\",\"data\":\"";
+        message += Base64Encode(jpeg, jpeg_len);
+        message += "\"}}}";
+        free(jpeg);
+        ESP_LOGI(TAG, "Sending photo to Gemini (%u bytes JPEG)", (unsigned)jpeg_len);
+        if (!SendText(message)) {
+            SendFunctionResult(call_id, name, "Failed to send the photo", true);
+            return;
+        }
+        std::string result = "The photo was taken and sent to you as the latest video frame. Look at it";
+        result += question.empty() ? " and describe what you see." : " and answer: " + question;
+        SendFunctionResult(call_id, name, result, false);
+        MarkActivity();
+    });
 }
 
 void GeminiLiveProtocol::EmitJson(cJSON* root)

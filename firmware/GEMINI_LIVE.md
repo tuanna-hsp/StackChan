@@ -29,6 +29,10 @@ goes back to wake word standby.
 - **Control the robot.** The robot gives all its MCP tools to Gemini as functions:
   head movement, LED color, reminders, and others. The robot runs a tool call locally
   and sends the result back to Gemini. Example: *"Look to the left."*
+- **See.** When you ask what it sees, Gemini calls `self.camera.take_photo`. The robot
+  takes a photo and sends it to Gemini as a JPEG image (`realtimeInput.video`). Then
+  Gemini describes the photo or answers your question about it. Example: *"What am I
+  holding?"*
 - **Give the settings page address.** The tool `self.gemini.get_settings_url` lets
   you ask the robot for the page address.
 
@@ -99,6 +103,7 @@ class translates between the two sides:
 |---|---|
 | `OpenAudioChannel()` | Opens the WebSocket and sends `setup` (model, voice, system prompt, functions, Google Search, transcription). Waits for `setupComplete`. |
 | `SendAudio()` | `realtimeInput.audio`: raw PCM16 at 16 kHz in base64. There is no Opus. |
+| Tool `self.camera.take_photo` | The robot handles this tool itself: it sends the photo as `realtimeInput.video`. The xiaozhi version sends the photo to the xiaozhi vision server. |
 | `SendStopListening()` | `realtimeInput.audioStreamEnd` |
 | `SendAbortSpeaking()` | Gemini has no stop message. The robot drops the remaining audio of the answer. |
 | JSON `tts` start, stop and sentence | Made from `modelTurn` audio, `turnComplete` and `outputTranscription`. |
@@ -106,6 +111,11 @@ class translates between the two sides:
 
 The robot sends the API key in the `x-goog-api-key` header, not in the URL. If the
 model refuses the transcription settings, the robot connects again without them.
+
+A separate task (`gemini_send`, with its stack in PSRAM) sends all the messages to
+Gemini. Thus a slow upload never blocks the main task, which runs the tool calls and the
+state changes. If more than about 3 s of microphone audio waits for upload, the robot
+drops the oldest audio.
 
 ### Files
 
@@ -131,35 +141,58 @@ These changes are in `patches/xiaozhi-esp32.patch`:
   - Adds a speaking epoch. With it, the protocol knows when the decoder reset at
     the start of the speaking state is complete.
   - Logs an error if the activation task cannot start.
+  - Turns off wake word detection while the robot speaks. Wake word detection also
+    turns on echo cancellation (AEC), which uses most of a CPU core. The robot needs
+    that CPU time to receive and decrypt Gemini's audio.
 - **`audio_service.{h,cc}`**
   - Adds PCM passthrough. With it, the mic audio goes to the send queue as raw PCM,
     and the robot plays `is_pcm` packets directly, resampled when necessary.
+  - Puts the stack of the `opus_codec` task (24 KB) in PSRAM. With Gemini, this task
+    only decodes the robot's own sounds. This change gives 24 KB of internal RAM to
+    Wi-Fi.
 - **`protocol.h`**
   - Adds `AudioStreamPacket::is_pcm`.
 
 ## Memory and network tuning
 
-When AI.AGENT runs, the ESP32-S3 has only about 15 KB of fragmented internal RAM.
-Most of it goes to the wake word and echo cancellation engine. Each of these
-settings fixes a problem that we found during testing:
+When AI.AGENT runs, the ESP32-S3 has very little internal RAM. Wi-Fi needs internal
+RAM for its receive buffers. When internal RAM was low, the robot lost packets: a
+connection took up to 16 s, the upload stopped for seconds, and answers stuttered.
+Each of these changes fixes a problem that we found during testing:
 
-| Setting | Problem it fixes |
+| Change | Problem it fixes |
 |---|---|
+| `opus_codec` task stack in PSRAM | This change gives 24 KB of internal RAM to Wi-Fi. Before it, free internal RAM fell to 2–6 KB in a session. Now it stays at about 19 KB. |
 | `CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_CROSS_SIGNED_VERIFY=y` | Google serves GTS Root R4 cross-signed by "GlobalSign Root CA". Without this setting, TLS fails with *"No matching trusted root certificate"*. |
-| `CONFIG_MBEDTLS_HARDWARE_AES=n` | Hardware AES needs DMA-capable internal RAM chunks. The allocation failed (`esp-aes: Failed to allocate memory`). Software AES is fast enough here. |
+| `CONFIG_MBEDTLS_HARDWARE_AES=n` | Hardware AES needs DMA-capable internal RAM chunks. The allocation failed (`esp-aes: Failed to allocate memory`). |
 | `CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y` | Wi-Fi and lwIP buffers use PSRAM first. Without this setting, the 7 KB setup message stalled (`SSL send timeout`). |
 | `CONFIG_ESP_WIFI_STATIC_TX_BUFFER_NUM=6` (was 16) | Each buffer holds about 1.6 KB of internal RAM. With 16 buffers, the 8 KB activation task could not start, and AI.AGENT stopped at "activating". |
-| `CONFIG_LWIP_TCP_SND_BUF_DEFAULT=32768` | The mic upload (about 43 KB/s in base64) does not block the main task. |
-| `CONFIG_LWIP_TCP_OOSEQ_MAX_PBUFS=2` | Out-of-order segments cannot fill all 6 Wi-Fi RX buffers, which stopped the connection in the middle of an answer. |
+| `CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=6` (was 3), `CONFIG_ESP_WIFI_RX_BA_WIN=6` | More Wi-Fi receive buffers, so the robot loses fewer packets. The window must not be larger than two times the static RX buffers. |
+| `CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=12` (was 6), `CONFIG_LWIP_TCP_WND_DEFAULT=12288`, `CONFIG_LWIP_TCP_RECVMBOX_SIZE=12` | Gemini's audio is about 64 KB/s in base64. With the default 5.7 KB window, the download was only about 35 KB/s, and the answers stuttered. |
+| `CONFIG_LWIP_TCP_OOSEQ_MAX_PBUFS=2` | Out-of-order segments cannot fill all the Wi-Fi RX buffers. When they did, the connection stopped in the middle of an answer. |
+| `CONFIG_LWIP_TCP_SND_BUF_DEFAULT=32768` | The mic upload (about 43 KB/s in base64) does not block. |
 | NVS partition 16 KB → 64 KB | The NVS was full. A save of a long system prompt failed. |
 
-The settings page server uses a PSRAM task stack, which saves 8 KB of internal RAM.
-Flash access is not permitted from a task with a PSRAM stack. Thus the page reads and
-writes NVS on the main task.
+The settings page server and the `gemini_send` task use PSRAM stacks. Flash access is
+not permitted from a task with a PSRAM stack. Thus the page reads and writes NVS on the
+main task.
 
-Do not increase the TCP receive window or the Wi-Fi RX buffer count. The Wi-Fi RX
-buffers stay in internal RAM. When we tried a 16 KB window with 24 RX buffers, the
-robot could not connect, and answers stopped in the middle.
+The receive task (`ssl_receive`) decrypts, decodes and parses all of Gemini's messages
+at priority 1. During long answers, it can keep a CPU core busy for seconds. It sleeps
+for one tick at least every 500 ms, so that the task watchdog does not trigger.
+
+### Diagnostics
+
+Set `kLogStats` to `true` in `gemini_live_protocol.cc` to log these values every 5 s
+in a session:
+
+```
+Stats 5s: up 84 msgs 215 KB (send avg 6 ms, max 8 ms, dropped 0, queued 0) | down 37 msgs 319 KB, audio 4960 ms
+CPU: IDLE1 67% IDLE0 65% ssl_receive 35% taskLVGL 6% wifi 5% ...
+```
+
+While the robot speaks, `audio` must be near 5000 ms. If it is lower, the answer
+stutters. The CPU line shows the use of each task. Two cores give a total of 200%.
 
 ## Audio behavior
 
@@ -169,11 +202,15 @@ robot could not connect, and answers stopped in the middle.
   delays do not cause gaps.
 - **Half duplex.** The robot does not send mic audio while an answer arrives or
   plays. This frees bandwidth for the answer and prevents the speaker echo from
-  interrupting it. As a result, **you cannot interrupt the robot while it speaks**.
+  interrupting it. The robot also does not listen for the wake word while it speaks.
+  As a result, **you cannot interrupt the robot while it speaks**.
 
 ## Known limitations
 
 - You cannot interrupt the robot while it speaks (half duplex, see above).
+- The on-screen transcript of your speech sometimes shows the wrong language, for
+  example Japanese as Korean. Gemini's own transcription guesses the language. The
+  answers are usually correct.
 - The StackChan App's Bluetooth Wi-Fi setup and device binding do not work. Use the
   hotspot setup.
 - The robot gets no OTA updates from the xiaozhi server.

@@ -1,5 +1,5 @@
 diff --git a/main/application.cc b/main/application.cc
-index 31de205..c8a63f9 100644
+index 31de205..fc0b506 100644
 --- a/main/application.cc
 +++ b/main/application.cc
 @@ -1,4 +1,5 @@
@@ -146,8 +146,17 @@ index 31de205..c8a63f9 100644
              SetDeviceState(kDeviceStateIdle);
              return;
          }
-@@ -1052,6 +1052,7 @@ void Application::HandleStateChangedEvent() {
-                 audio_service_.EnableWakeWordDetection(audio_service_.IsAfeWakeWord());
+@@ -1048,10 +1048,14 @@ void Application::HandleStateChangedEvent() {
+ 
+             if (listening_mode_ != kListeningModeRealtime) {
+                 audio_service_.EnableVoiceProcessing(false);
+-                // Only AFE wake word can be detected in speaking mode
+-                audio_service_.EnableWakeWordDetection(audio_service_.IsAfeWakeWord());
++                // Only AFE wake word can be detected in speaking mode. Gemini Live keeps it
++                // off: it turns on AEC, which takes most of a CPU core while the device must
++                // also receive and decrypt Gemini's audio stream, and the answer stuttered.
++                audio_service_.EnableWakeWordDetection(!gemini_live::is_enabled() &&
++                                                       audio_service_.IsAfeWakeWord());
              }
              audio_service_.ResetDecoder();
 +            speaking_epoch_++;
@@ -186,10 +195,50 @@ index f2b9a00..171cb86 100644
      ListeningMode GetDefaultListeningMode() const;
      
 diff --git a/main/audio/audio_service.cc b/main/audio/audio_service.cc
-index 7f7582b..b3f9f82 100644
+index 7f7582b..9818d86 100644
 --- a/main/audio/audio_service.cc
 +++ b/main/audio/audio_service.cc
-@@ -406,46 +406,50 @@ void AudioService::OpusCodecTask() {
+@@ -1,4 +1,5 @@
+ #include "audio_service.h"
++#include <hal/gemini/gemini_live.h>
+ #include <esp_log.h>
+ #include <cstring>
+ 
+@@ -161,13 +162,26 @@ void AudioService::Start() {
+ #endif
+ 
+     /* Start the opus codec task */
+-    xTaskCreate(
+-        [](void* arg) {
+-            AudioService* audio_service = (AudioService*)arg;
+-            audio_service->OpusCodecTask();
+-            vTaskDelete(NULL);
+-        },
+-        "opus_codec", 2048 * 12, this, 2, &opus_codec_task_handle_);
++    if (gemini_live::is_enabled()) {
++        // Gemini Live sends and receives raw PCM, so this task only decodes the device's own
++        // sounds. Its 24 KB stack goes in PSRAM: internal RAM is needed for Wi-Fi buffers.
++        xTaskCreatePinnedToCoreWithCaps(
++            [](void* arg) {
++                AudioService* audio_service = (AudioService*)arg;
++                audio_service->OpusCodecTask();
++                vTaskDeleteWithCaps(NULL);
++            },
++            "opus_codec", 2048 * 12, this, 2, &opus_codec_task_handle_, tskNO_AFFINITY,
++            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
++    } else {
++        xTaskCreate(
++            [](void* arg) {
++                AudioService* audio_service = (AudioService*)arg;
++                audio_service->OpusCodecTask();
++                vTaskDelete(NULL);
++            },
++            "opus_codec", 2048 * 12, this, 2, &opus_codec_task_handle_);
++    }
+ }
+ 
+ void AudioService::Stop() {
+@@ -406,46 +420,50 @@ void AudioService::OpusCodecTask() {
              task.playback_id = packet->playback_id;
              task.media_position_ms = packet->media_position_ms;
  
@@ -276,7 +325,7 @@ index 7f7582b..b3f9f82 100644
              }
  
              lock.lock();
-@@ -474,7 +478,23 @@ void AudioService::OpusCodecTask() {
+@@ -474,7 +492,23 @@ void AudioService::OpusCodecTask() {
              packet->sample_rate = 16000;
              packet->timestamp = task.timestamp;
  
@@ -301,7 +350,7 @@ index 7f7582b..b3f9f82 100644
                  packet->payload.resize(encoder_outbuf_size_);
                  esp_audio_enc_in_frame_t in = {
                      .buffer = (uint8_t*)(task.pcm.data()),
-@@ -529,6 +549,43 @@ void AudioService::OpusCodecTask() {
+@@ -529,6 +563,43 @@ void AudioService::OpusCodecTask() {
      ESP_LOGW(TAG, "Opus codec task stopped");
  }
  

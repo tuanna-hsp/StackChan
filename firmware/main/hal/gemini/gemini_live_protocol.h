@@ -12,6 +12,8 @@
 #include <esp_timer.h>
 #include <atomic>
 #include <memory>
+#include <condition_variable>
+#include <deque>
 #include <mutex>
 #include <vector>
 #include <string>
@@ -43,7 +45,36 @@ protected:
     bool SendText(const std::string& text) override;
 
 private:
+    // Guards websocket_ between the main task (connect, close) and the sender task.
+    std::mutex socket_mutex_;
     std::unique_ptr<WebSocket> websocket_;
+
+    // Outgoing messages are sent by a separate task, so a slow upload never blocks the
+    // main task (which runs tool calls and state changes). Old mic audio is dropped when
+    // the upload falls behind, which keeps Gemini's view of the conversation current.
+    struct Outgoing {
+        std::string text;
+        bool is_audio;
+    };
+    std::mutex send_mutex_;
+    std::condition_variable send_cv_;
+    std::deque<Outgoing> send_queue_;
+    size_t queued_audio_ = 0;
+    TaskHandle_t sender_task_ = nullptr;
+    std::atomic<bool> sender_stop_{false};
+    void SenderTask();
+    bool Enqueue(std::string text, bool is_audio);
+    void ClearSendQueue();
+    void ResetSocket();
+    bool SendNow(const std::string& text);
+
+    // Diagnostics, logged every 5 s during a session when kLogStats is true.
+    std::atomic<uint32_t> stat_up_msgs_{0}, stat_up_bytes_{0}, stat_up_dropped_{0};
+    std::atomic<uint32_t> stat_send_total_ms_{0}, stat_send_max_ms_{0};
+    std::atomic<uint32_t> stat_down_msgs_{0}, stat_down_bytes_{0}, stat_down_audio_bytes_{0};
+    std::vector<TaskStatus_t> last_task_stats_;
+    uint32_t last_task_runtime_ = 0;
+    void LogStats();
     EventGroupHandle_t event_group_ = nullptr;
     esp_timer_handle_t idle_timer_  = nullptr;
 
@@ -51,6 +82,7 @@ private:
     std::atomic<bool> in_model_turn_{false};
     std::atomic<bool> drop_model_turn_{false};
     std::atomic<int64_t> last_activity_us_{0};
+    TickType_t last_yield_tick_ = 0;
     // Some models reject transcription settings; remember after the first refusal.
     bool transcription_supported_ = true;
     int next_mcp_id_                = 1;
@@ -74,6 +106,9 @@ private:
     void ClearPcm();
     void HandleToolCall(const cJSON* tool_call);
     void SendToolResponse(const std::string& call_id, const std::string& name, const std::string& mcp_reply);
+    void SendFunctionResult(const std::string& call_id, const std::string& name, const std::string& text,
+                            bool is_error);
+    void TakePhoto(const std::string& call_id, const std::string& name, const std::string& question);
     void BeginModelTurn();
     void EndModelTurn();
     void EmitJson(cJSON* root);
