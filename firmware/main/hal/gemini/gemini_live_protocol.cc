@@ -50,6 +50,8 @@ constexpr uint8_t kPhotoJpegQuality  = 60;
 // a stalled connection; a short backlog is caught up during pauses.
 constexpr size_t kMaxQueuedAudio     = 50;
 constexpr int kStatsIntervalMs       = 5000;
+// Reconnects allowed per conversation after the connection drops.
+constexpr int kMaxReconnects         = 3;
 // Set to true to log upload/download rates and per-task CPU use every 5 s in a session.
 constexpr bool kLogStats             = false;
 constexpr EventBits_t kSetupDoneBit  = BIT0;
@@ -216,6 +218,12 @@ bool GeminiLiveProtocol::Start()
 
 bool GeminiLiveProtocol::OpenAudioChannel()
 {
+    // A new conversation starts a new session.
+    {
+        std::lock_guard<std::mutex> lock(resume_mutex_);
+        resume_handle_.clear();
+    }
+    reconnects_ = 0;
     const auto config = gemini_live::load_config();
     if (config.api_key.empty()) {
         SetError("Gemini API key is not set", "Open " + gemini_live::settings_url() + " to set it");
@@ -251,7 +259,8 @@ bool GeminiLiveProtocol::OpenAudioChannel()
 }
 
 GeminiLiveProtocol::ConnectResult GeminiLiveProtocol::Connect(const gemini_live::Config& config,
-                                                              bool with_transcription)
+                                                              bool with_transcription,
+                                                              const std::string& resume_handle)
 {
     error_occurred_ = false;
     channel_open_   = false;
@@ -283,8 +292,9 @@ GeminiLiveProtocol::ConnectResult GeminiLiveProtocol::Connect(const gemini_live:
     websocket_->OnDisconnected([this]() {
         ESP_LOGW(TAG, "Gemini closed the connection");
         xEventGroupSetBits(event_group_, kClosedBit);
-        if (channel_open_.exchange(false) && on_audio_channel_closed_ != nullptr) {
-            on_audio_channel_closed_();
+        if (channel_open_.exchange(false)) {
+            // Dropped during a conversation, not closed by us: reconnect on the main task.
+            Application::GetInstance().Schedule([this]() { Reconnect(); });
         }
     });
 
@@ -297,7 +307,7 @@ GeminiLiveProtocol::ConnectResult GeminiLiveProtocol::Connect(const gemini_live:
         return ConnectResult::kNetworkError;
     }
 
-    if (!SendNow(BuildSetupMessage(config, with_transcription))) {
+    if (!SendNow(BuildSetupMessage(config, with_transcription, resume_handle))) {
         ResetSocket();
         return ConnectResult::kNetworkError;
     }
@@ -318,6 +328,54 @@ GeminiLiveProtocol::ConnectResult GeminiLiveProtocol::Connect(const gemini_live:
         on_audio_channel_opened_();
     }
     return ConnectResult::kOk;
+}
+
+void GeminiLiveProtocol::Reconnect()
+{
+    // Skip if the app closed the channel meanwhile (that resets the socket).
+    if (channel_open_ || websocket_ == nullptr) {
+        return;
+    }
+    const bool was_answering = in_model_turn_;
+    if (was_answering) {
+        EndModelTurn();  // the rest of this answer is lost; the queued audio still plays
+    }
+    drop_model_turn_ = false;
+    ClearSendQueue();
+    ResetSocket();
+
+    std::string handle;
+    {
+        std::lock_guard<std::mutex> lock(resume_mutex_);
+        handle = resume_handle_;
+    }
+    ConnectResult result = ConnectResult::kNetworkError;
+    if (reconnects_ < kMaxReconnects) {
+        ++reconnects_;
+        ESP_LOGW(TAG, "Connection lost, reconnecting (%s, attempt %d)",
+                 handle.empty() ? "new session" : "resuming session", reconnects_);
+        const auto config = gemini_live::load_config();
+        result = Connect(config, transcription_supported_, handle);
+        if (result != ConnectResult::kOk && !handle.empty()) {
+            // The handle may have expired; continue in a new session.
+            handle.clear();
+            result = Connect(config, transcription_supported_);
+        }
+    }
+    if (result == ConnectResult::kOk) {
+        ESP_LOGI(TAG, "Reconnected");
+        if (was_answering && !handle.empty()) {
+            SendText(
+                "{\"realtimeInput\":{\"text\":\"(The connection dropped while you were answering. "
+                "Briefly continue from where you stopped.)\"}}");
+        }
+        return;
+    }
+    ESP_LOGE(TAG, "Reconnect failed");
+    ResetSocket();
+    if (on_audio_channel_closed_ != nullptr) {
+        on_audio_channel_closed_();
+    }
 }
 
 void GeminiLiveProtocol::CloseAudioChannel(bool /*send_goodbye*/)
@@ -562,7 +620,8 @@ void GeminiLiveProtocol::SendMcpMessage(const std::string& /*message*/)
     // MCP notifications target the xiaozhi server; tool calls are handled locally.
 }
 
-std::string GeminiLiveProtocol::BuildSetupMessage(const gemini_live::Config& config, bool with_transcription)
+std::string GeminiLiveProtocol::BuildSetupMessage(const gemini_live::Config& config, bool with_transcription,
+                                                  const std::string& resume_handle)
 {
     cJSON* root  = cJSON_CreateObject();
     cJSON* setup = cJSON_AddObjectToObject(root, "setup");
@@ -598,6 +657,12 @@ std::string GeminiLiveProtocol::BuildSetupMessage(const gemini_live::Config& con
     cJSON* search_tool = cJSON_CreateObject();
     cJSON_AddObjectToObject(search_tool, "googleSearch");
     cJSON_AddItemToArray(tools, search_tool);
+
+    // Gemini then sends resumption handles; with one, the session continues after a drop.
+    cJSON* resumption = cJSON_AddObjectToObject(setup, "sessionResumption");
+    if (!resume_handle.empty()) {
+        cJSON_AddStringToObject(resumption, "handle", resume_handle.c_str());
+    }
 
     if (with_transcription) {
         cJSON_AddObjectToObject(setup, "inputAudioTranscription");
@@ -675,8 +740,15 @@ void GeminiLiveProtocol::OnMessage(const char* data, size_t len)
         HandleServerContent(content);
     } else if (const cJSON* tool_call = cJSON_GetObjectItem(root, "toolCall"); cJSON_IsObject(tool_call)) {
         HandleToolCall(tool_call);
+    } else if (const cJSON* update = cJSON_GetObjectItem(root, "sessionResumptionUpdate"); cJSON_IsObject(update)) {
+        const cJSON* handle = cJSON_GetObjectItem(update, "newHandle");
+        if (cJSON_IsTrue(cJSON_GetObjectItem(update, "resumable")) && cJSON_IsString(handle) &&
+            handle->valuestring[0] != '\0') {
+            std::lock_guard<std::mutex> lock(resume_mutex_);
+            resume_handle_ = handle->valuestring;
+        }
     } else if (cJSON_GetObjectItem(root, "goAway") != nullptr) {
-        // The session is about to hit its time limit; the next turn opens a new one.
+        // The session is about to hit its time limit; Reconnect() resumes it when it closes.
         ESP_LOGW(TAG, "Session ending soon (goAway)");
     } else if (cJSON_GetArraySize(root) > 0 && cJSON_GetObjectItem(root, "toolCallCancellation") == nullptr &&
                cJSON_GetObjectItem(root, "usageMetadata") == nullptr &&

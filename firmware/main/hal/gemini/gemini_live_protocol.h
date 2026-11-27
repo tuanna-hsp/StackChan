@@ -98,8 +98,17 @@ private:
     std::string model_text_;
 
     enum class ConnectResult { kOk, kNetworkError, kSetupRefused };
-    ConnectResult Connect(const gemini_live::Config& config, bool with_transcription);
-    std::string BuildSetupMessage(const gemini_live::Config& config, bool with_transcription);
+    ConnectResult Connect(const gemini_live::Config& config, bool with_transcription,
+                          const std::string& resume_handle = "");
+    std::string BuildSetupMessage(const gemini_live::Config& config, bool with_transcription,
+                                  const std::string& resume_handle);
+
+    // When the connection drops during a conversation (network error, or Gemini's session
+    // time limit), reconnect and resume the same session instead of going idle.
+    std::mutex resume_mutex_;
+    std::string resume_handle_;
+    int reconnects_ = 0;
+    void Reconnect();
     cJSON* BuildFunctionDeclarations();
     void OnMessage(const char* data, size_t len);
     void HandleServerContent(const cJSON* content);

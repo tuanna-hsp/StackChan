@@ -196,6 +196,19 @@ CPU: IDLE1 67% IDLE0 65% ssl_receive 35% taskLVGL 6% wifi 5% ...
 While the robot speaks, `audio` must be near 5000 ms. If it is lower, the answer
 stutters. The CPU line shows the use of each task. Two cores give a total of 200%.
 
+## Reconnect
+
+If the connection drops during a conversation (a network error, or the session time
+limit of Gemini Live), the robot reconnects and does not go back to standby:
+
+- It uses the latest session resumption handle from Gemini, so Gemini keeps the
+  context of the conversation. If the handle does not work, the robot starts a new
+  session.
+- If the drop cut off an answer, the robot asks Gemini to continue from where it
+  stopped.
+- The robot reconnects at most 3 times in each conversation. If it cannot reconnect,
+  it goes back to standby.
+
 ## Audio behavior
 
 - **Playback buffer.** Gemini sends audio at about real-time speed in small chunks.
@@ -224,7 +237,5 @@ stutters. The CPU line shows the use of each task. Two cores give a total of 200
 - The StackChan App's Bluetooth Wi-Fi setup and device binding do not work. Use the
   hotspot setup.
 - The robot gets no OTA updates from the xiaozhi server.
-- Gemini Live sessions have a time limit. When Gemini sends `goAway`, the session ends
-  and the next wake word opens a new session. The robot does not resume sessions.
 - `gemini_live::is_enabled()` always returns `true`. There is no switch back to the
   xiaozhi server at run time.
