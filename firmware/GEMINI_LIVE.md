@@ -168,7 +168,8 @@ Each of these changes fixes a problem that we found during testing:
 | `CONFIG_MBEDTLS_HARDWARE_AES=n` | Hardware AES needs DMA-capable internal RAM chunks. The allocation failed (`esp-aes: Failed to allocate memory`). |
 | `CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y` | Wi-Fi and lwIP buffers use PSRAM first. Without this setting, the 7 KB setup message stalled (`SSL send timeout`). |
 | `CONFIG_ESP_WIFI_STATIC_TX_BUFFER_NUM=6` (was 16) | Each buffer holds about 1.6 KB of internal RAM. With 16 buffers, the 8 KB activation task could not start, and AI.AGENT stopped at "activating". |
-| `CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=6` (was 3), `CONFIG_ESP_WIFI_RX_BA_WIN=6` | More Wi-Fi receive buffers, so the robot loses fewer packets. The window must not be larger than two times the static RX buffers. |
+| `CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=10` (was 3), `CONFIG_ESP_WIFI_RX_BA_WIN=6` | More Wi-Fi receive buffers, so the robot loses fewer packets. With 6 buffers, the download still stopped for 1–4 s at a time, and answers stuttered. The window must not be larger than two times the static RX buffers. |
+| Display draw buffer 10 lines (was 20) | This change gives 6.4 KB of internal DMA RAM to the extra Wi-Fi receive buffers. |
 | `CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=12` (was 6), `CONFIG_LWIP_TCP_WND_DEFAULT=12288`, `CONFIG_LWIP_TCP_RECVMBOX_SIZE=12` | Gemini's audio is about 64 KB/s in base64. With the default 5.7 KB window, the download was only about 35 KB/s, and the answers stuttered. |
 | `CONFIG_LWIP_TCP_OOSEQ_MAX_PBUFS=2` | Out-of-order segments cannot fill all the Wi-Fi RX buffers. When they did, the connection stopped in the middle of an answer. |
 | `CONFIG_LWIP_TCP_SND_BUF_DEFAULT=32768` | The mic upload (about 43 KB/s in base64) does not block. |

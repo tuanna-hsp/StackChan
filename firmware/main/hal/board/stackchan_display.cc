@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: MIT
  */
 #include "stackchan_display.h"
+#include <hal/gemini/gemini_live.h>
 #include <esp_log.h>
 #include <esp_err.h>
 #include <esp_lvgl_port.h>
@@ -131,7 +132,9 @@ StackChanAvatarDisplay::StackChanAvatarDisplay(esp_lcd_panel_io_handle_t panel_i
         .io_handle      = panel_io_,
         .panel_handle   = panel_,
         .control_handle = nullptr,
-        .buffer_size    = static_cast<uint32_t>(width_ * 20),
+        // 10 lines (6.4 KB of internal DMA RAM) instead of 20: with Gemini Live, Wi-Fi
+        // needs the internal RAM for receive buffers more than the display needs speed.
+        .buffer_size    = static_cast<uint32_t>(width_ * (gemini_live::is_enabled() ? 10 : 20)),
         .double_buffer  = false,
         .trans_size     = 0,
         .hres           = static_cast<uint32_t>(width_),
