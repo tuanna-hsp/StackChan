@@ -115,7 +115,8 @@ model refuses the transcription settings, the robot connects again without them.
 A separate task (`gemini_send`, with its stack in PSRAM) sends all the messages to
 Gemini. Thus a slow upload never blocks the main task, which runs the tool calls and the
 state changes. If more than about 3 s of microphone audio waits for upload, the robot
-drops the oldest audio.
+drops the oldest audio. When Gemini starts to answer, the robot drops all the mic audio
+that still waits for upload.
 
 ### Files
 
@@ -197,9 +198,17 @@ stutters. The CPU line shows the use of each task. Two cores give a total of 200
 ## Audio behavior
 
 - **Playback buffer.** Gemini sends audio at about real-time speed in small chunks.
-  The robot merges the chunks into 200 ms packets. Each answer starts after 500 ms of
+  The robot merges the chunks into 200 ms packets. Each answer starts after 800 ms of
   audio has arrived. The playback queue can hold about 4 s of audio, so small network
-  delays do not cause gaps.
+  delays do not cause gaps. If playback runs dry during an answer (on a slow Wi-Fi
+  link), the robot buffers 800 ms again before it continues. This gives a few short
+  pauses instead of continuous stutter.
+- **Wi-Fi access point.** On a mesh network, the robot connects to the access point
+  with the strongest signal and stays on it (the `remember_bssid` setting of the
+  hotspot setup page, which the firmware turns on by default). Without it, the robot
+  often joined a weak access point, and sessions failed or stuttered.
+- **Wi-Fi channel width.** The robot uses a 20 MHz channel. With the default 40 MHz,
+  it lost many packets on a busy 2.4 GHz band. Gemini needs much less than 1 Mbit/s.
 - **Half duplex.** The robot does not send mic audio while an answer arrives or
   plays. This frees bandwidth for the answer and prevents the speaker echo from
   interrupting it. The robot also does not listen for the wake word while it speaks.

@@ -65,6 +65,7 @@ private:
     void SenderTask();
     bool Enqueue(std::string text, bool is_audio);
     void ClearSendQueue();
+    void DropQueuedAudio();
     void ResetSocket();
     bool SendNow(const std::string& text);
 
@@ -86,8 +87,9 @@ private:
     // Some models reject transcription settings; remember after the first refusal.
     bool transcription_supported_ = true;
     int next_mcp_id_                = 1;
-    // Model audio is merged into larger packets, and the start of each answer is held
-    // back briefly, so the decode queue covers network jitter (see HandleModelAudio).
+    // Model audio is merged into larger packets, and the start of each answer (and the
+    // audio after playback runs dry) is held back briefly, so the decode queue covers
+    // network jitter (see HandleModelAudio).
     std::mutex pcm_mutex_;
     std::vector<uint8_t> pending_pcm_;
     int pending_pcm_rate_   = 0;

@@ -38,7 +38,7 @@ constexpr int kSpeakingWaitMs        = 1000;
 // Model audio packet size and the audio held back before an answer starts playing.
 // The decode queue holds 20 packets, so 200 ms packets give it ~4 s of headroom.
 constexpr int kPcmPacketMs           = 200;
-constexpr int kPcmPrebufferMs        = 500;
+constexpr int kPcmPrebufferMs        = 800;  // also refilled after playback runs dry
 // The receive task (priority 1) parses, decodes and decrypts every message. During long
 // answers that can keep its CPU busy for seconds, starving the idle task and tripping the
 // task watchdog, so it sleeps one tick at least this often while busy.
@@ -380,6 +380,15 @@ bool GeminiLiveProtocol::Enqueue(std::string text, bool is_audio)
     }
     send_cv_.notify_one();
     return true;
+}
+
+void GeminiLiveProtocol::DropQueuedAudio()
+{
+    std::lock_guard<std::mutex> lock(send_mutex_);
+    send_queue_.erase(std::remove_if(send_queue_.begin(), send_queue_.end(),
+                                     [](const Outgoing& item) { return item.is_audio; }),
+                      send_queue_.end());
+    queued_audio_ = 0;
 }
 
 void GeminiLiveProtocol::ResetSocket()
@@ -771,7 +780,16 @@ void GeminiLiveProtocol::HandleModelAudio(const cJSON* inline_data)
         FlushPcm();
     }
 
+    // On a slow Wi-Fi link the answer can arrive slower than it plays. When playback runs
+    // dry, buffer again before resuming: a few short pauses sound better than constant
+    // stutter.
+    const bool playback_dry = Application::GetInstance().GetAudioService().IsPlaybackIdle();
+
     std::unique_lock<std::mutex> lock(pcm_mutex_);
+    if (playback_started_ && playback_dry) {
+        ESP_LOGW(TAG, "Playback ran dry, buffering");
+        playback_started_ = false;
+    }
     pending_pcm_rate_ = rate;
     pending_pcm_.insert(pending_pcm_.end(), pcm.begin(), pcm.end());
     const size_t bytes_per_ms = static_cast<size_t>(rate) * sizeof(int16_t) / 1000;
@@ -824,6 +842,9 @@ void GeminiLiveProtocol::BeginModelTurn()
 {
     ClearPcm();
     in_model_turn_ = true;
+    // Gemini is answering, so mic audio still waiting for upload is stale; dropping it
+    // leaves the link to the answer.
+    DropQueuedAudio();
 
     // Entering the speaking state resets the decoder on the main task. Wait for that
     // before streaming, otherwise the reset discards the start of the answer.
