@@ -10,6 +10,9 @@
 #include "settings.h"
 
 #include <esp_log.h>
+#include <nvs.h>
+#include <esp_event.h>
+#include <esp_wifi.h>
 #include <driver/i2c_master.h>
 #include <wifi_station.h>
 #include <esp_lcd_panel_io.h>
@@ -675,9 +678,54 @@ private:
         camera_->SetHMirror(false);
     }
 
+    // The Wi-Fi station scans, sorts the APs by signal, then connects with a fast scan that
+    // joins the first AP of the SSID it hears on that channel. On a mesh network that was
+    // often a weak node, and Gemini Live sessions failed or stuttered. With remember_bssid
+    // it joins the strongest AP from its scan. A desk robot does not need to roam. The
+    // hotspot setup page can still turn this off; it is only set when it was never set.
+    void PreferStrongestAccessPoint()
+    {
+        nvs_handle_t handle;
+        if (nvs_open("wifi", NVS_READWRITE, &handle) != ESP_OK) {
+            return;
+        }
+        uint8_t value = 0;
+        if (nvs_get_u8(handle, "remember_bssid", &value) == ESP_ERR_NVS_NOT_FOUND) {
+            if (nvs_set_u8(handle, "remember_bssid", 1) == ESP_OK && nvs_commit(handle) == ESP_OK) {
+                ESP_LOGI(TAG, "Wi-Fi: connect to the strongest AP (remember_bssid)");
+            }
+        }
+        nvs_close(handle);
+    }
+
+    // Use a 20 MHz channel. On a busy 2.4 GHz band the default 40 MHz mode lost many
+    // packets: Gemini connections took up to 30 s or failed and answers stuttered. Gemini
+    // needs well under 1 Mbit/s, so the narrower channel costs nothing.
+    static void UseNarrowWifiChannel()
+    {
+        // The Wi-Fi manager accepts an existing default event loop.
+        const esp_err_t err = esp_event_loop_create_default();
+        if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+            return;
+        }
+        // Registered before the station's handler, so it runs before the first scan.
+        esp_event_handler_register(
+            WIFI_EVENT, WIFI_EVENT_STA_START,
+            [](void*, esp_event_base_t, int32_t, void*) {
+                if (esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW20) == ESP_OK) {
+                    ESP_LOGI(TAG, "Wi-Fi: 20 MHz channel");
+                }
+            },
+            nullptr);
+    }
+
 public:
     M5StackCoreS3Board()
     {
+        if (gemini_live::is_enabled()) {
+            PreferStrongestAccessPoint();
+            UseNarrowWifiChannel();
+        }
         InitializeI2c();
         InitializeAxp2101();
         InitializePowerSaveTimer();
